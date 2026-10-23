@@ -1,0 +1,468 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RDP_USERNAME: "Rafael"
+  RDP_PASSWORD: "P@ssw0rd!"
+  BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+  BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+  BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+      # 1. REPOSITORIO
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. MARCAR HORA DE INICIO
+      - name: Mark Start
+        shell: powershell
+        run: |
+          "JOB_START=$([DateTime]::UtcNow.ToString('o'))" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # 3. CRIAR SCRIPTS DE BACKUP
+      - name: Write Backup Scripts
+        shell: powershell
+        run: |
+          $dir = "C:\backup\scripts"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+
+          # ---------------- common.ps1 ----------------
+          @'
+          $ErrorActionPreference = "Continue"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Add-Type -AssemblyName System.Net.Http
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $User        = if ($env:RDP_USERNAME) { $env:RDP_USERNAME } else { "Rafael" }
+          $ProfilePath = "C:\Users\$User"
+          $Work        = "C:\backup"
+          $AssetName   = "pc-backup.bin"
+          $NewAsset    = "pc-backup-new.bin"
+          $Tag         = "backup"
+
+          function Test-BackupConfig {
+              foreach ($n in "BACKUP_TOKEN", "BACKUP_REPO", "BACKUP_PASSWORD") {
+                  $v = [Environment]::GetEnvironmentVariable($n)
+                  if ([string]::IsNullOrWhiteSpace($v)) {
+                      Write-Host "Secret $n nao configurado. Backup desativado."
+                      return $false
+                  }
+              }
+              return $true
+          }
+
+          function Invoke-Gh([string]$Method, [string]$Url, $Body = $null) {
+              $p = @{
+                  Method    = $Method
+                  Uri       = $Url
+                  Headers   = @{
+                      Authorization = "Bearer $env:BACKUP_TOKEN"
+                      Accept        = "application/vnd.github+json"
+                  }
+                  UserAgent = "pc-backup"
+              }
+              if ($Body) {
+                  $p.Body        = ($Body | ConvertTo-Json)
+                  $p.ContentType = "application/json"
+              }
+              Invoke-RestMethod @p
+          }
+
+          function Get-BackupRelease([bool]$Create) {
+              $base = "https://api.github.com/repos/$env:BACKUP_REPO/releases"
+              try {
+                  return Invoke-Gh GET "$base/tags/$Tag"
+              } catch {
+                  $resp = $_.Exception.Response
+                  if (-not $resp -or $resp.StatusCode.value__ -ne 404) { throw }
+              }
+              if (-not $Create) { return $null }
+              return Invoke-Gh POST $base @{
+                  tag_name   = $Tag
+                  name       = "Backup do PC"
+                  body       = "Backup criptografado. Nao apague."
+                  draft      = $false
+                  prerelease = $false
+              }
+          }
+
+          function Protect-File([string]$In, [string]$Out, [string]$Password) {
+              $salt = New-Object byte[] 16
+              $iv   = New-Object byte[] 16
+              $rng  = [Security.Cryptography.RandomNumberGenerator]::Create()
+              $rng.GetBytes($salt)
+              $rng.GetBytes($iv)
+
+              $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($Password, $salt, 200000)
+              $aes = [Security.Cryptography.Aes]::Create()
+              $aes.Key = $kdf.GetBytes(32)
+              $aes.IV  = $iv
+
+              $fs = [IO.File]::Create($Out)
+              $fs.Write($salt, 0, 16)
+              $fs.Write($iv, 0, 16)
+              $cs  = New-Object Security.Cryptography.CryptoStream($fs, $aes.CreateEncryptor(), [Security.Cryptography.CryptoStreamMode]::Write)
+              $src = [IO.File]::OpenRead($In)
+              try { $src.CopyTo($cs) }
+              finally { $cs.Dispose(); $src.Dispose(); $fs.Dispose() }
+          }
+
+          function Unprotect-File([string]$In, [string]$Out, [string]$Password) {
+              $fs   = [IO.File]::OpenRead($In)
+              $salt = New-Object byte[] 16
+              $iv   = New-Object byte[] 16
+              [void]$fs.Read($salt, 0, 16)
+              [void]$fs.Read($iv, 0, 16)
+
+              $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($Password, $salt, 200000)
+              $aes = [Security.Cryptography.Aes]::Create()
+              $aes.Key = $kdf.GetBytes(32)
+              $aes.IV  = $iv
+
+              $cs  = New-Object Security.Cryptography.CryptoStream($fs, $aes.CreateDecryptor(), [Security.Cryptography.CryptoStreamMode]::Read)
+              $dst = [IO.File]::Create($Out)
+              try { $cs.CopyTo($dst) }
+              finally { $dst.Dispose(); $cs.Dispose(); $fs.Dispose() }
+          }
+
+          function Send-Asset([string]$UploadUrl, [string]$File, [string]$Name) {
+              $url = ($UploadUrl -replace '\{.*$', '') + "?name=$Name"
+              $client = New-Object System.Net.Http.HttpClient
+              $client.Timeout = [TimeSpan]::FromMinutes(60)
+              $client.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $env:BACKUP_TOKEN)
+              $client.DefaultRequestHeaders.UserAgent.ParseAdd("pc-backup")
+
+              $fs = [IO.File]::OpenRead($File)
+              try {
+                  $content = New-Object System.Net.Http.StreamContent($fs)
+                  $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream")
+                  $resp = $client.PostAsync($url, $content).GetAwaiter().GetResult()
+                  $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                  if (-not $resp.IsSuccessStatusCode) { throw "Upload falhou: $($resp.StatusCode) $text" }
+                  return ($text | ConvertFrom-Json)
+              } finally {
+                  $fs.Dispose()
+                  $client.Dispose()
+              }
+          }
+
+          function Receive-Asset([string]$AssetApiUrl, [string]$Dest) {
+              $handler = New-Object System.Net.Http.HttpClientHandler
+              $handler.AllowAutoRedirect = $false
+              $c = New-Object System.Net.Http.HttpClient($handler)
+              $c.Timeout = [TimeSpan]::FromMinutes(60)
+              $c.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $env:BACKUP_TOKEN)
+              $c.DefaultRequestHeaders.UserAgent.ParseAdd("pc-backup")
+              $c.DefaultRequestHeaders.Accept.ParseAdd("application/octet-stream")
+
+              $r = $c.GetAsync($AssetApiUrl).GetAwaiter().GetResult()
+              if ([int]$r.StatusCode -in 301, 302, 303, 307, 308) {
+                  $location = $r.Headers.Location.AbsoluteUri
+                  $c2 = New-Object System.Net.Http.HttpClient
+                  $c2.Timeout = [TimeSpan]::FromMinutes(60)
+                  $stream = $c2.GetStreamAsync($location).GetAwaiter().GetResult()
+                  $out = [IO.File]::Create($Dest)
+                  try { $stream.CopyTo($out) } finally { $out.Dispose(); $stream.Dispose(); $c2.Dispose() }
+              } elseif ($r.IsSuccessStatusCode) {
+                  $stream = $r.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                  $out = [IO.File]::Create($Dest)
+                  try { $stream.CopyTo($out) } finally { $out.Dispose(); $stream.Dispose() }
+              } else {
+                  throw "Download falhou: $($r.StatusCode)"
+              }
+              $c.Dispose()
+          }
+          '@ | Set-Content "$dir\common.ps1" -Encoding UTF8
+
+          # ---------------- save.ps1 ----------------
+          @'
+          . "$PSScriptRoot\common.ps1"
+
+          if (-not (Test-BackupConfig)) { exit 0 }
+
+          if (-not (Test-Path $ProfilePath)) {
+              Write-Host "Perfil de $User ainda nao existe (ninguem entrou). Nada a salvar."
+              exit 0
+          }
+
+          Write-Host "===== SALVANDO BACKUP ====="
+          New-Item -ItemType Directory -Force $Work | Out-Null
+          $stage = "$Work\stage"
+          $zip   = "$Work\pc.zip"
+          $bin   = "$Work\pc.bin"
+          Remove-Item $stage, $zip, $bin -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "$stage\files", "$stage\reg", "$stage\system" | Out-Null
+
+          # ---- 1. Arquivos (fotos, downloads, configs de apps) ----
+          $folders = @(
+              "Desktop", "Documents", "Pictures", "Downloads", "Videos", "Music",
+              "AppData\Roaming",
+              "AppData\Local\Google\Chrome\User Data\Default"
+          )
+          $xd = @("Cache", "Code Cache", "GPUCache", "GrShaderCache", "ShaderCache", "Crashpad", "Temp", "CacheStorage")
+
+          foreach ($f in $folders) {
+              $src = Join-Path $ProfilePath $f
+              if (Test-Path $src) {
+                  Write-Host "Copiando $f"
+                  robocopy $src (Join-Path "$stage\files" $f) /E /R:0 /W:0 /MAX:209715200 /XD $xd /NFL /NDL /NJH /NJS /NP | Out-Null
+              }
+          }
+
+          if (Test-Path "C:\Apps") {
+              Write-Host "Copiando C:\Apps"
+              robocopy "C:\Apps" "$stage\system\Apps" /E /R:0 /W:0 /MAX:209715200 /NFL /NDL /NJH /NJS /NP | Out-Null
+          }
+
+          # ---- 2. Configuracoes do Windows (registro do usuario) ----
+          $sid = (Get-LocalUser -Name $User).SID.Value
+          $hk = $null
+          $loadedByUs = $false
+
+          if (Test-Path "Registry::HKEY_USERS\$sid") {
+              $hk = "HKU\$sid"
+          } else {
+              reg load HKU\RafaelSave "$ProfilePath\NTUSER.DAT" | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                  $hk = "HKU\RafaelSave"
+                  $loadedByUs = $true
+              }
+          }
+
+          if ($hk) {
+              $keys = @(
+                  "Control Panel\Desktop",
+                  "Control Panel\Colors",
+                  "Control Panel\International",
+                  "Control Panel\Mouse",
+                  "Control Panel\Keyboard",
+                  "Control Panel\Accessibility",
+                  "Environment",
+                  "Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+                  "Software\Microsoft\Windows\CurrentVersion\Themes",
+                  "Software\Microsoft\Windows\CurrentVersion\Search",
+                  "Software\Microsoft\Windows\DWM"
+              )
+              $i = 0
+              foreach ($k in $keys) {
+                  $i++
+                  reg export "$hk\$k" "$stage\reg\k$i.reg" /y 2>$null | Out-Null
+              }
+              if ($loadedByUs) {
+                  [gc]::Collect()
+                  Start-Sleep -Seconds 1
+                  reg unload HKU\RafaelSave | Out-Null
+              }
+          } else {
+              Write-Host "Nao foi possivel acessar o registro do usuario."
+          }
+
+          # ---- 3. Lista de aplicativos ----
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+              winget export -o "$stage\apps.json" --accept-source-agreements 2>$null | Out-Null
+          }
+          Get-ItemProperty `
+              "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*", `
+              "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName } |
+              Select-Object DisplayName, DisplayVersion |
+              Sort-Object DisplayName |
+              Export-Csv "$stage\apps-instalados.csv" -NoTypeInformation
+
+          # ---- 4. Compactar e criptografar ----
+          Write-Host "Compactando..."
+          [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
+          Write-Host "Criptografando..."
+          Protect-File $zip $bin $env:BACKUP_PASSWORD
+          Remove-Item $zip -Force
+
+          $sizeMB = [math]::Round((Get-Item $bin).Length / 1MB, 1)
+          Write-Host "Tamanho do backup: $sizeMB MB"
+          if ((Get-Item $bin).Length -gt 1.9GB) {
+              Write-Host "ERRO: backup maior que 1.9 GB (limite do GitHub). Backup anterior mantido."
+              exit 0
+          }
+
+          # ---- 5. Enviar (envia novo, so depois apaga o antigo) ----
+          try {
+              $rel = Get-BackupRelease $true
+              $assets = @($rel.assets)
+
+              foreach ($a in ($assets | Where-Object { $_.name -eq $NewAsset })) {
+                  Invoke-Gh DELETE $a.url | Out-Null
+              }
+
+              Write-Host "Enviando..."
+              $new = Send-Asset $rel.upload_url $bin $NewAsset
+
+              foreach ($a in ($assets | Where-Object { $_.name -eq $AssetName })) {
+                  Invoke-Gh DELETE $a.url | Out-Null
+              }
+              Invoke-Gh PATCH $new.url @{ name = $AssetName } | Out-Null
+              Write-Host "Backup salvo com sucesso."
+          } catch {
+              Write-Host "Falha ao enviar o backup: $($_.Exception.Message)"
+          }
+
+          Remove-Item $bin, $stage -Recurse -Force -ErrorAction SilentlyContinue
+          exit 0
+          '@ | Set-Content "$dir\save.ps1" -Encoding UTF8
+
+          # ---------------- restore.ps1 ----------------
+          @'
+          param([ValidateSet("Files", "Apps")][string]$Part = "Files")
+
+          . "$PSScriptRoot\common.ps1"
+          $ex = "$Work\extracted"
+
+          if ($Part -eq "Files") {
+              if (-not (Test-BackupConfig)) { exit 0 }
+
+              Write-Host "===== RESTAURANDO BACKUP ====="
+              $rel = Get-BackupRelease $false
+              $asset = $null
+              if ($rel) {
+                  $asset = @($rel.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+              }
+              if (-not $asset) {
+                  Write-Host "Nenhum backup encontrado (primeira execucao). Seguindo sem restaurar."
+                  exit 0
+              }
+
+              New-Item -ItemType Directory -Force $Work | Out-Null
+              $bin = "$Work\pc.bin"
+              $zip = "$Work\pc.zip"
+              Remove-Item $bin, $zip, $ex -Recurse -Force -ErrorAction SilentlyContinue
+
+              Write-Host "Baixando backup..."
+              Receive-Asset $asset.url $bin
+              Write-Host "Descriptografando..."
+              try {
+                  Unprotect-File $bin $zip $env:BACKUP_PASSWORD
+              } catch {
+                  Write-Host "ERRO: senha do backup incorreta ou arquivo corrompido."
+                  exit 0
+              }
+              [IO.Compression.ZipFile]::ExtractToDirectory($zip, $ex)
+              Remove-Item $bin, $zip -Force
+
+              # ---- Criar o perfil do usuario (pasta C:\Users\Rafael) ----
+              if (-not [IO.File]::Exists("$ProfilePath\NTUSER.DAT")) {
+                  Write-Host "Criando perfil do usuario $User..."
+                  try {
+                      $cred = New-Object System.Management.Automation.PSCredential(
+                          ".\$User",
+                          (ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force))
+                      Start-Process cmd.exe -ArgumentList "/c exit" -Credential $cred `
+                          -LoadUserProfile -WorkingDirectory "C:\Windows\System32" -Wait
+                  } catch {
+                      Write-Host "Nao foi possivel criar o perfil: $($_.Exception.Message)"
+                  }
+              }
+
+              if ([IO.File]::Exists("$ProfilePath\NTUSER.DAT")) {
+                  $dest = $ProfilePath
+              } else {
+                  $dest = "C:\Restore-$User"
+                  Write-Host "AVISO: perfil nao criado. Arquivos restaurados em $dest"
+              }
+
+              # ---- Arquivos ----
+              if (Test-Path "$ex\files") {
+                  Write-Host "Restaurando arquivos..."
+                  robocopy "$ex\files" $dest /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP | Out-Null
+              }
+              if (Test-Path "$ex\system\Apps") {
+                  robocopy "$ex\system\Apps" "C:\Apps" /E /R:0 /W:0 /NFL /NDL /NJH /NJS /NP | Out-Null
+              }
+
+              # ---- Configuracoes do Windows ----
+              if ((Test-Path "$ex\reg") -and [IO.File]::Exists("$ProfilePath\NTUSER.DAT")) {
+                  Write-Host "Restaurando configuracoes do Windows..."
+                  reg load HKU\RafaelTmp "$ProfilePath\NTUSER.DAT" | Out-Null
+                  if ($LASTEXITCODE -eq 0) {
+                      Get-ChildItem "$ex\reg\*.reg" | ForEach-Object {
+                          $t = Get-Content $_.FullName -Raw -Encoding Unicode
+                          $t = $t -replace '(?m)^\[HKEY_USERS\\[^\\\]]+', '[HKEY_USERS\RafaelTmp'
+                          Set-Content $_.FullName $t -Encoding Unicode
+                          reg import $_.FullName 2>$null | Out-Null
+                      }
+                      [gc]::Collect()
+                      Start-Sleep -Seconds 1
+                      reg unload HKU\RafaelTmp | Out-Null
+                  } else {
+                      Write-Host "Nao foi possivel carregar o registro do usuario."
+                  }
+              }
+              Write-Host "Restauracao de arquivos e configuracoes concluida."
+          }
+
+          if ($Part -eq "Apps") {
+              $f = "$ex\apps.json"
+              if (Test-Path $f) {
+                  if (Get-Command winget -ErrorAction SilentlyContinue) {
+                      Write-Host "Reinstalando aplicativos..."
+                      winget import -i $f --accept-package-agreements --accept-source-agreements `
+                          --ignore-unavailable --disable-interactivity
+                  } else {
+                      Write-Host "winget indisponivel. Veja a lista em $ex\apps-instalados.csv"
+                  }
+              } else {
+                  Write-Host "Nenhuma lista de apps para restaurar."
+              }
+          }
+
+          exit 0
+          '@ | Set-Content "$dir\restore.ps1" -Encoding UTF8
+
+          Write-Host "Scripts de backup criados em $dir"
+
+      # 4. INFORMACOES DO SISTEMA
+      - name: Show Windows and Hardware Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object Manufacturer, Model,
+              @{Name="RAM_GB";Expression={[math]::Round($_.TotalPhysicalMemory / 1GB, 2)}}
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+      # 5. ATIVAR RDP
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+          Write-Host "RDP configurado."
+
+      # 6. CRIAR CONTA RDP
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $username = $env:RDP_USERNAME
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($null -eq $user) {
+            New-LocalUser -Name $username -Password $securePassword `
+              -FullName $usernam
